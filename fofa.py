@@ -1,178 +1,444 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-# @Time    : 2022/9/14 22:20
-# @Author  : Cl0udG0d
-# @File    : fofa.py
-# @Github: https://github.com/Cl0udG0d
-import argparse
-import os
+#!/usr/bin/env python3
+"""
+Fofa 搜索工具 - 极简版
+自动模式切换，一键搜索，稳定可靠，极速代理
+
+使用:
+    python fofa.py "app='Apache'"                 # 搜索（默认启用代理）
+    python fofa.py "port=80" 50 json              # 50条结果，json格式
+    python fofa.py --no-proxy "app='Apache'"      # 不使用代理（如果API可用）
+    python fofa.py --help                         # 查看帮助
+"""
+
 import sys
-import time
-from core.fofaMain import FofaMain
-from tookit import unit, config
-from tookit.levelData import LevelData
-from tookit.outputData import OutputData
-from tookit.unit import clipKeyWord, outputLogo
-import gettext
-import locale
-import mmh3
-import requests
-import base64
-import codecs
-config.ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
-if getattr(sys, 'frozen', None):
-    dir = sys._MEIPASS
-else:
-    dir = config.ROOT_PATH
-# 获取当前的语言设置
-lang, _ = locale.getdefaultlocale()
-if lang and lang.startswith('zh'):
-    # 如果是中文环境，不需要翻译，直接用原始字符串
-    _ = lambda x: x
-else:
-    # 如果是其他语言环境，则加载对应的翻译文件
-    language = gettext.translation('fofa_hack', localedir=os.path.join(dir, "locale"), languages=['en'])
-    language.install()
-    _ = language.gettext
+import asyncio
+from typing import Optional
+
+# 当前目录支持
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from fofa_hack.models.search import SearchConfig, OutputFormat
+from fofa_hack.core.unified_client import AutoProxyUnifiedFofaClient
+from fofa_hack.utils.output import save_results
+
+# 简单RichUI支持（可选）
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    USE_RICH = True
+except ImportError:
+    USE_RICH = False
+    console = None
+
+
+def get_console():
+    """获取控制台输出"""
+    if USE_RICH:
+        return Console()
+    return None
+
+
+def print_help():
+    """打印帮助信息"""
+    help_text = """
+[bold cyan]Fofa 搜索工具 - 极简版[/bold cyan]
+
+[bright_black]功能:[/bright_black]
+  • 自动API/WEB模式切换
+  • IP封禁时自动换代理（后台极速收集）
+  • 默认启用自动代理，一键搜索
+  • 支持JSON/CSV/TXT输出
+
+[bright_black]使用方法:[/bright_black]
+  [yellow]基本搜索（自动代理）:[/yellow]
+    python fofa.py "app='Apache'"                    # 自动代理搜索
+    python fofa.py "port=80" 50 json                 # 50条结果，json格式
+    python fofa.py "title='管理后台'"                 # 搜索标题
+    python fofa.py '"Ollama is running" && domain="true"' 100  # 复杂查询
+
+  [yellow]不使用代理（如果API可用）:[/yellow]
+    python fofa.py --no-proxy "app='Apache'"         # 不使用代理
+
+  [yellow]批量/高级:[/yellow]
+    python fofa.py "country='CN' && port=443" 100     # 100条结果
+    python fofa.py --debug "query"                   # 调试模式
+
+[bright_black]参数说明:[/bright_black]
+  --no-proxy       禁用自动代理（默认启用）
+  --debug          调试模式（显示详细日志）
+  --help           显示帮助信息
+
+[bright_black]输出格式:[/bright_black] json, csv, txt (默认: json)
+[bright_black]结果数量:[/bright_black] 默认20条，可指定任意数量
+
+[bright cyan]提示:[/bright cyan]
+  1. 默认自动代理，无需配置，极速收集
+  2. 被封禁时会立即自动换代理
+  3. 复杂查询结果较少是正常现象
+  4. 如API可用，建议使用 --no-proxy 加快速度
+    """
+
+    if USE_RICH:
+        console = Console()
+        console.print(Panel(help_text, title="Fofa 搜索工具", border_style="cyan"))
+    else:
+        print("Fofa 搜索工具 - 帮助")
+        print("=" * 50)
+        print("搜索: python fofa.py '查询语句' [数量] [格式]")
+        print("禁用代理: python fofa.py --no-proxy '查询语句'")
+        print("帮助: python fofa.py --help")
+
+
+def show_stats(stats: dict):
+    """显示统计信息"""
+    if USE_RICH:
+        console = Console()
+        table = Table(title="搜索统计", show_header=False)
+        table.add_row("总请求数", str(stats.get("total", 0)))
+        table.add_row("成功", str(stats.get("success", 0)))
+        table.add_row("失败", str(stats.get("failed", 0)))
+        table.add_row("成功率", stats.get("rate", "0%"))
+        table.add_row("封禁次数", str(stats.get("bans", 0)))
+        table.add_row("当前模式", stats.get("mode", "unknown"))
+        table.add_row("代理总数", str(stats.get("pool_count", 0)))
+
+        pool_ready = stats.get("pool_ready")
+        if pool_ready:
+            table.add_row("代理状态", "✅ 就绪")
+        else:
+            table.add_row("代理状态", "⏳ 收集中")
+
+        console.print(table)
+    else:
+        print("\n搜索统计:")
+        print(f"总请求数: {stats.get('total', 0)}")
+        print(f"成功: {stats.get('success', 0)}")
+        print(f"失败: {stats.get('failed', 0)}")
+        print(f"成功率: {stats.get('rate', '0%')}")
+        print(f"封禁次数: {stats.get('bans', 0)}")
+        print(f"当前模式: {stats.get('mode', 'unknown')}")
+        print(f"代理总数: {stats.get('pool_count', 0)}")
+        if stats.get("pool_ready"):
+            print("代理状态: ✅ 就绪")
+        else:
+            print("代理状态: ⏳ 收集中")
+
+
+def show_results(results):
+    """显示前3条结果"""
+    if not results:
+        return
+
+    if USE_RICH:
+        console = Console()
+        console.print("\n[cyan]前3条结果:[/cyan]")
+        for i, r in enumerate(results[:3], 1):
+            console.print(f"  {i}. {r.link or r.host}")
+            if r.ip:
+                console.print(f"     IP: {r.ip}:{r.port}")
+            if r.city:
+                console.print(f"     城市: {r.city}")
+            if r.title:
+                console.print(f"     标题: {r.title[:50]}")
+    else:
+        print("\n前3条结果:")
+        for i, r in enumerate(results[:3], 1):
+            print(f"  {i}. {r.link or r.host}")
+            if r.ip:
+                print(f"     IP: {r.ip}:{r.port}")
+            if r.city:
+                print(f"     城市: {r.city}")
+            if r.title:
+                print(f"     标题: {r.title[:50]}")
+
+
+async def search(query: str, count: int = 20, output: str = 'json', use_proxy: bool = True, debug: bool = False):
+    """执行搜索 - 智能主函数"""
+
+    console = get_console()
+
+    # 配置 - 优化的等待时间
+    config = SearchConfig(
+        keyword=query,
+        end_count=count,
+        time_sleep=0.5 if use_proxy else 1.0,  # 代理模式更快循环
+        debug=debug
+    )
+
+    # 显示配置
+    if console:
+        console.print(Panel.fit(
+            f"[bold cyan]🤖 Fofa 智能搜索[/bold cyan]\\\\n"
+            f"[yellow]查询[/yellow]: {query}\\\\n"
+            f"[yellow]数量[/yellow]: {count}\\\\n"
+            f"[yellow]格式[/yellow]: {output}\\\\n"
+            f"[yellow]代理[/yellow]: {'自动收集' if use_proxy else '无'}\\n"
+            f"[yellow]提示[/yellow]: 复杂查询结果可能较少",
+            title="配置"
+        ))
+    else:
+        print(f"搜索: {query}, 数量: {count}, 格式: {output}, 代理: {use_proxy}")
+
+    # 创建客户端 - 启动极速代理收集（后台）
+    if console:
+        console.print("[cyan]🚀 启动极速代理系统（后台收集）...[/cyan]")
+    else:
+        print("🚀 启动极速代理系统...")
+
+    client = AutoProxyUnifiedFofaClient(config, auto_refresh_proxy=use_proxy)
+
+    # 开始搜索（边搜边收集）
+    if console:
+        console.print("[cyan]🔍 开始搜索（代理后台加速中）...[/cyan]")
+    else:
+        print("🔍 开始搜索...")
+
+    results = client.search_all(query, max_pages=20)
+
+    # 分析结果质量并决定是否需要等待代理
+    stats = client.get_stats()
+    proxy_count = client.proxy_manager.count
+    proxy_ready = client.proxy_manager.is_ready
+
+    # 如果结果很少，且代理还没就绪，等待并重试
+    if len(results) < min(count, 10) and use_proxy and not proxy_ready:
+        if console:
+            console.print("[yellow]⚠️  结果偏少，等待代理池收集完成（最多15秒）...[/yellow]")
+            try:
+                # 轻量等待，不阻塞
+                for i in range(15):
+                    if client.proxy_manager.is_ready and client.proxy_manager.count > 0:
+                        break
+                    await asyncio.sleep(1)
+                    if i > 0 and i % 5 == 0 and console:
+                        console.print(f"[cyan]⏳ 收集中... {client.proxy_manager.count}个代理[/cyan]")
+            except:
+                pass
+        else:
+            print("⚠️  等待代理收集...")
+            for i in range(15):
+                if client.proxy_manager.is_ready and client.proxy_manager.count > 0:
+                    break
+                await asyncio.sleep(1)
+
+        # 代理就绪后重试（仅在结果过少时）
+        if client.proxy_manager.is_ready and client.proxy_manager.count >= 3:
+            if console:
+                console.print(f"[bold green]✅ 代理池就绪！可用: {client.proxy_manager.count}个[/bold green]")
+                console.print("[cyan]🔍 重新搜索提升结果质量...[/cyan]")
+            else:
+                print(f"✅ 代理池就绪！可用: {client.proxy_manager.count}个")
+                print("🔍 重新搜索...")
+
+            # 清空统计重新搜索
+            client.total = 0
+            client.success = 0
+            client.failed = 0
+            client.ban_count = 0
+
+            new_results = client.search_all(query, max_pages=20)
+            if len(new_results) > len(results):
+                results = new_results
+                if console:
+                    console.print(f"[bold green]✅ 提升成功！获取到 {len(results)} 条结果[/bold green]")
+                else:
+                    print(f"✅ 提升成功！获取到 {len(results)} 条结果")
+            else:
+                if console:
+                    console.print("[yellow]⚠️  未显著提升，使用首次结果[/yellow]")
+                else:
+                    print("⚠️  未显著提升，使用首次结果")
+        else:
+            if console and use_proxy:
+                console.print("[yellow]⚠️  代理收集未完成，使用当前最佳结果[/yellow]")
+            elif use_proxy:
+                print("⚠️  代理收集未完成，使用当前最佳结果")
+
+    # 处理结果
+    if not results:
+        if console:
+            console.print("[red]❌ 未找到结果[/red]")
+            if use_proxy and not proxy_ready:
+                console.print("[cyan]提示: 代理仍在收集，可稍后重试[/cyan]")
+        else:
+            print("❌ 未找到结果")
+            if use_proxy and not proxy_ready:
+                print("提示: 代理仍在收集，可稍后重试")
+        show_stats(client.get_stats())
+        return ""
+
+    # 保存结果
+    filename = save_results(results, OutputFormat(output), f"fofa_results_{len(results)}")
+
+    if console:
+        console.print(f"[bold green]✅ 搜索完成！获取到 {len(results)} 条结果[/bold green]")
+        console.print(f"[green]📁 文件: {filename}[/green]")
+    else:
+        print(f"✅ 搜索完成！获取到 {len(results)} 条结果")
+        print(f"📁 文件: {filename}")
+
+    show_stats(client.get_stats())
+    show_results(results)
+
+    return filename
+
+
+async def interactive_search():
+    """交互式搜索"""
+    console = get_console()
+
+    if console:
+        console.print(Panel.fit(
+            "[bold cyan]🤖 Fofa 智能搜索工具[/bold cyan]\\\\n"
+            "极速代理收集，全自动模式\\\\n\\\\n"
+            "支持功能:\\\\n"
+            "- 自动从多个源收集代理\\\\n"
+            "- IP封禁时自动秒切\\\\n"
+            "- 智能模式（API/WEB）\\\\n\\\\n"
+            "示例:\\\\n"
+            '  app="Apache"\\\\n'
+            '  port="80"\\\\n'
+            '  "Ollama is running"\\\\n'
+            '  country="CN"',
+            title="欢迎使用"
+        ))
+    else:
+        print("Fofa 智能搜索工具")
+        print("=" * 30)
+        print("示例: app='Apache', port=80, 'Ollama is running'")
+
+    while True:
+        if console:
+            console.print("\\n[bold]请输入搜索关键词 (输入 q 退出):[/bold]")
+        else:
+            print("\n请输入搜索关键词 (输入 q 退出):")
+
+        query = input("> ").strip()
+
+        if query.lower() == 'q':
+            if console:
+                console.print("[cyan]👋 再见！[/cyan]")
+            else:
+                print("再见！")
+            break
+
+        if not query:
+            if console:
+                console.print("[yellow]⚠️  请输入关键词[/yellow]")
+            else:
+                print("⚠️  请输入关键词")
+            continue
+
+        # 输出格式
+        if console:
+            console.print("\\n[bold]选择输出格式:[/bold]")
+            console.print("  1. JSON (默认)")
+            console.print("  2. CSV (Excel)")
+            console.print("  3. TXT (文本)")
+            choice = input("选择 (1/2/3, 回车默认1): ").strip()
+        else:
+            choice = input("输出格式 (1=JSON, 2=CSV, 3=TXT, 回车默认1): ").strip()
+
+        format_map = {'1': 'json', '2': 'csv', '3': 'txt'}
+        output_format = format_map.get(choice, 'json')
+
+        # 结果数量
+        count_input = input("结果数量 (回车默认20): ").strip()
+        try:
+            count = int(count_input) if count_input else 20
+        except ValueError:
+            count = 20
+
+        # 是否使用代理
+        use_proxy_input = input("使用自动代理? (y/n, 回车默认y): ").strip().lower()
+        use_proxy = use_proxy_input != 'n'
+
+        try:
+            await search(query, count, output_format, use_proxy)
+            if console:
+                console.print(f"\\n[bold green]✅ 搜索完成！[/bold green]")
+            else:
+                print("\n✅ 搜索完成！")
+        except KeyboardInterrupt:
+            if console:
+                console.print("\\n[red]⚠️  搜索已取消[/red]")
+            else:
+                print("\n⚠️  搜索已取消")
+        except Exception as e:
+            if console:
+                console.print(f"\\n[red]❌ 错误: {e}[/red]")
+            else:
+                print(f"\n❌ 错误: {e}")
 
 
 def main():
-    outputLogo()
-    parser = argparse.ArgumentParser(description=_("Fofa-hack v{} 使用说明").format(config.VERSION_NUM))
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--keyword', '-k', help=_('fofa搜索关键字'))
-    group.add_argument('--inputfile', '-i', help=_("指定文件,从文件中批量读取fofa语法"))
-    group.add_argument('--base', '-b', help=_("以base64的形式输入关键字 -b InRoaW5rcGhwIg=="))
-    group.add_argument('--iconurl', type=str, help="指定url的icon作为icon_hash关键字")
-    group.add_argument('--iconfile', type=str, help="指定icon_file作为icon_hash关键字")
+    """主入口"""
+    args = sys.argv[1:]
 
-    parser.add_argument('--timesleep', '-t', help=_('爬取每一页等待秒数,防止IP被Ban,默认为3'), default=3)
-    parser.add_argument('--timeout', '-to', help=_('爬取每一页的超时时间,默认为180秒'), default=180)
-    parser.add_argument('--endcount', '-e', help=_('爬取结束数量'))
-    parser.add_argument('--level', '-l', help=_('爬取等级: 1-3 ,数字越大内容越详细,默认为 1'))
-    parser.add_argument('--output', '-o', help=_('输出格式:txt、json、csv,默认为txt'))
-    parser.add_argument('--outputname','-on', help=_("指定输出文件名，默认文件名为 fofaHack"))
-    parser.add_argument('--fuzz', '-f', help=_('关键字fuzz参数,增加内容获取粒度'), action='store_true')
+    # 无参数 - 显示帮助
+    if not args:
+        print_help()
+        return
 
-    parser.add_argument('--proxy-type',choices=['socks4','socks5', 'http'], help=_("代理类型,默认为http"),default='http')
-    parser.add_argument('--authorization', type=str, help="指定Authorization值")
-    parser.add_argument('--authorization-file', type=str, help="从文件中读取authorization列表 --authorization-file authorization.txt")
+    # 帮助
+    if '--help' in args or '-h' in args:
+        print_help()
+        return
 
-    parser.add_argument('--fofa-key', type=str,
-                        help="fofa api key值(配合fofa终身会员使用)")
-    parser.add_argument('--debug',
-                        help="fofa-hack调试模式,运行过程中输出更多运行日志", action='store_true')
-    parser.add_argument('--time-type',
-                        help="fofa-hack时间类型 (day | hour)，默认为day，如果选择hour的话数据采集粒度会变成按小时的",choices=['day','hour'],default='day')
-    proxy_group = parser.add_mutually_exclusive_group()
-    proxy_group.add_argument('--proxy', help=_("指定代理,代理格式 --proxy '127.0.0.1:7890'"))
-    proxy_group.add_argument('--proxy-url', help=_("指定代理url，即访问URL响应为proxy,代理格式 --proxy-url http://127.0.0.1/proxy_pool/get"))
-    proxy_group.add_argument('--proxy-file', help=_("指定txt格式的代理文件,按行分割,代理格式 --proxy-file proxy.txt"))
-    # parser.add_argument('--type', type=str, choices=["common", "selenium"], default="common",
-    #                     help="运行类型,默认为普通方式")
-    args = parser.parse_args()
+    # 交互模式?
+    if len(args) == 0 or (len(args) == 1 and args[0] == '-i'):
+        if sys.stdin.isatty():
+            asyncio.run(interactive_search())
+            return
 
-    if args.debug:
-        config.DEBUG = args.debug
+    # 解析参数
+    debug = False
+    query = None
+    count = 20
+    output = 'json'
+    use_proxy = True  # 默认启用代理
 
-    if args.time_type:
-        config.TIME_TYPE = args.time_type
-
-    if args.fofa_key:
-        config.FOFA_KEY = args.fofa_key
-
-    if args.authorization_file:
-        config.AUTHORIZATION_FILE = args.authorization_file
-        with open(config.AUTHORIZATION_FILE, 'r') as f:
-            for line in f.readlines():
-                config.AUTHORIZATION_LIST.append(line)
-
-    time_sleep = int(args.timesleep)
-    timeout = int(args.timeout)
-    if args.keyword:
-        search_key = clipKeyWord(args.keyword)
-    elif args.base:
-        try:
-            search_key = base64.b64decode(args.base).decode('utf-8')
-        except Exception as e:
-            print(e)
-            search_key = ""
-            pass
-    elif args.iconurl:
-        if args.iconurl.endswith(".ico"):
-            icon_url = args.iconurl
-        else :
-            icon_url = args.iconurl + "favicon32.ico" if  args.iconurl.endswith("/") else args.iconurl + "/favicon32.ico"
-        try:
-            _icon = mmh3.hash(
-                codecs.lookup('base64').encode(requests.get(icon_url).content)[0])
-            search_key = '''icon_hash="{}"'''.format(_icon)
-        except:
-            print("icon url " + icon_url + " 访问错误")
-            exit(0)
-    elif args.iconfile:
-        file_path = args.iconfile
-        if os.path.exists(file_path):
-            with open(file_path, 'rb') as f:
-                _icon = mmh3.hash(codecs.lookup('base64').encode(f.read())[0])
-                search_key = '''icon_hash="{}"'''.format(_icon)
-    else:
-        search_key = ""
-
-    endcount = int(args.endcount) if args.endcount else 100
-    level = args.level if args.level else "1"
-    level_data = LevelData(level)
-    fuzz = args.fuzz
-
-
-    output = args.output if args.output else "txt"
-    outputname = args.outputname if args.outputname else "fofaHack"
-
-    if search_key:
-        # if outputname:
-        filename="{}.{}".format(outputname,output)
-        # 检查文件是否存在
-        if os.path.exists(filename) and os.path.exists("final_"+filename):
-            # 如果存在，删除文件
-            os.remove(filename)
-            os.remove("final_"+filename)
-        # else:
-        #     filename = "{}_{}.{}".format(unit.md5(search_key), int(time.time()), output)
-        output_data = OutputData(filename, level, pattern=output)
-    else:
-        # filename = _("暂无")
-        filename="{}.{}".format(outputname,output)
-        output_data = OutputData(filename, level, pattern=output)
-
-    if args.proxy or args.proxy_url or args.proxy_file :
-        config.IS_PROXY = True
-        if args.proxy:
-            config.PROXY_SINGLE = True
-            config.PROXY_ARGS = args.proxy
-        elif args.proxy_url :
-            config.PROXY_FROM_URL = True
-            config.PROXY_ARGS = args.proxy_url
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ['-p', '--proxy']:
+            use_proxy = True
+        elif arg in ['--no-proxy']:
+            use_proxy = False
+        elif arg in ['--debug']:
+            debug = True
+        elif arg in ['--help', '-h']:
+            print_help()
+            return
+        elif arg.startswith('-'):
+            i += 1
+            continue
         else:
-            config.PROXY_FROM_TXT = True
-            config.PROXY_ARGS = args.proxy_file
-    if args.proxy_type:
-        config.PROXY_TYPE = args.proxy_type
+            if query is None:
+                query = arg
+            elif count == 20 and arg.isdigit():
+                count = int(arg)
+            elif output == 'json':
+                output = arg.lower()
+        i += 1
 
-    # is_proxy, proxy = setProxy(args.proxy,args.proxy_type)
-    # type = args.type
-    inputfile = args.inputfile if args.inputfile else None
-    if not inputfile and not search_key:
-        print(_("未输入搜索内容"))
-        exit(0)
-    if args.authorization:
-        # 用户输入了Authorization值
-        # print("用户输入的Authorization值为:", args.authorization)
-        config.AUTHORIZATION = args.authorization
+    if not query:
+        print("❌ 请指定搜索关键词")
+        print("使用: python fofa.py '查询语句' [数量] [格式]")
+        return
 
-    fofa = FofaMain(search_key, inputfile, filename, time_sleep, endcount, level, level_data, output, output_data,
-                    fuzz, timeout, config.IS_PROXY)
-    fofa.start()
+    # 执行搜索
+    try:
+        asyncio.run(search(query, count, output, use_proxy, debug))
+    except KeyboardInterrupt:
+        print("\n⚠️  搜索已取消")
+        sys.exit(0)
+    except Exception as e:
+        print(f"❌ 错误: {e}")
+        sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
